@@ -367,7 +367,7 @@ impl MmioOps for Bar {
         Ok(ret as u64)
     }
 
-    fn write(&mut self, addr: u64, access_size: u8, value: u32) -> hypercraft::HyperResult {
+    fn write(&mut self, addr: u64, access_size: u8, value: u64) -> hypercraft::HyperResult {
         let offset = addr - self.address;
         let write_func = &*self.ops.as_ref().unwrap().write;
         let value_bytes = value.to_le_bytes();

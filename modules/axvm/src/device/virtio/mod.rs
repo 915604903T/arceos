@@ -8,7 +8,7 @@ pub use crate::device::virtio::device::dummy::DummyVirtioDevice;
 // pub use device::net::*;
 // pub use device::serial::{find_port_by_nr, get_max_nr, Serial, SerialPort, VirtioSerialState};
 pub use queue::*;
-pub use transport::virtio_pci::VirtioPciDevice;
+pub use transport::virtio_pci::{VirtioPciDevice, GLOBAL_VIRTIO_PCI_CFG_REQ};
 
 use alloc::boxed::Box;
 use alloc::format;

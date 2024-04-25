@@ -8,7 +8,8 @@ use core::any::Any;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU16, Ordering};
-use spin::{mutex, Mutex};
+use spin::{mutex, Mutex, rwlock::RwLock};
+use lazy_static::lazy_static;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -112,6 +113,38 @@ const COMMON_Q_USEDHI_REG: u64 = 0x34;
 ///   1: select feature bits 32 to 63.
 const MAX_FEATURES_SELECT_NUM: u32 = 2;
 
+lazy_static! {
+    pub static ref GLOBAL_VIRTIO_PCI_CFG_REQ: RwLock<Option<MmioReq>> = RwLock::new(None);
+}
+
+/// Virtio mmio req
+#[derive(Clone, Debug)]
+pub struct MmioReq {
+    /// data
+    pub data: Vec<u8>,
+    /// access size
+    pub len: u8,
+    /// access address
+    pub addr: u64,
+    /// is write
+    pub is_write: bool,
+}
+
+impl MmioReq {
+    fn new(
+        data: Vec<u8>,
+        len: u8,
+        addr: u64,
+        is_write: bool,
+    ) -> Self {
+        MmioReq {
+            data,
+            len,
+            addr,
+            is_write,
+        }
+    }
+}
 /// Get class id according to device type.
 ///
 /// # Arguments
@@ -696,14 +729,14 @@ impl VirtioPciDevice {
     }
 
     // Access virtio configuration through VirtioPciCfgAccessCap.
-    fn do_cfg_access(&mut self, start: usize, end: usize, is_write: bool) {
+    fn do_cfg_access(&mut self, start: usize, end: usize, is_write: bool) -> Option<MmioReq> {
         let pci_cfg_data_offset =
             self.cfg_cap_offset + offset_of!(VirtioPciCfgAccessCap, pci_cfg_data);
         let cap_size = size_of::<VirtioPciCfgAccessCap>();
         // SAFETY: pci_cfg_data_offset is the offset of VirtioPciCfgAccessCap in Pci config space
         // which is much less than u16::MAX.
         if !ranges_overlap(start, end - start, pci_cfg_data_offset, cap_size).unwrap() {
-            return;
+            return None;
         }
 
         // pci config access cap
@@ -716,21 +749,21 @@ impl VirtioPciDevice {
         let len = LittleEndian::read_u32(&config[offset_of!(VirtioPciCap, length)..]);
         if bar >= VIRTIO_PCI_BAR_MAX {
             warn!("The bar_id {} of VirtioPciCfgAccessCap exceeds max", bar);
-            return;
+            return None;
         }
         let bar_base = self.base.config.get_bar_address(bar as usize);
         // check bar access whether is valid
         if bar_base == BAR_SPACE_UNMAPPED {
             debug!("The bar {} of VirtioPciCfgAccessCap is not mapped", bar);
-            return;
+            return None;
         }
         if ![1, 2, 4].contains(&len) {
             debug!("The length {} of VirtioPciCfgAccessCap is illegal", len);
-            return;
+            return None;
         }
         if off & (len - 1) != 0 {
             warn!("The offset {} of VirtioPciCfgAccessCap is not aligned", off);
-            return;
+            return None;
         }
         if (off as u64)
             .checked_add(len as u64)
@@ -738,8 +771,11 @@ impl VirtioPciDevice {
             .is_none()
         {
             warn!("The access range of VirtioPciCfgAccessCap exceeds bar size");
-            return;
+            return None;
         }
+        let mut data = self.base.config.config[pci_cfg_data_offset..].as_ref();
+        let mmio_req = MmioReq::new(data.to_vec(), len as u8, (bar_base + off as u64), is_write);
+        Some(mmio_req)
 
         // let result = if is_write {
         //     let mut data = self.base.config.config[pci_cfg_data_offset..].as_ref();
@@ -948,7 +984,11 @@ impl PciDevOps for VirtioPciDevice {
     }
 
     fn read_config(&mut self, offset: usize, data: &mut [u8]) {
-        self.do_cfg_access(offset, offset + data.len(), false);
+        let mmio_req = self.do_cfg_access(offset, offset + data.len(), false);
+        if mmio_req.is_some() {
+            *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = mmio_req;
+            return;
+        }
         self.base.config.read(offset, data);
     }
 
@@ -968,7 +1008,10 @@ impl PciDevOps for VirtioPciDevice {
         self.base
             .config
             .write(offset, data, self.dev_id.clone().load(Ordering::Acquire));
-        self.do_cfg_access(offset, end, true);
+        let mmio_req = self.do_cfg_access(offset, end, true);
+        if mmio_req.is_some() {
+            *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = mmio_req;
+        }
     }
 
     fn reset(&mut self, _reset_child_device: bool) -> HyperResult<()> {

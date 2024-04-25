@@ -21,7 +21,8 @@ use device_emu::{ApicBaseMsrHandler, Bundle, VirtLocalApic};
 use hypercraft::{GuestPageTableTrait, MmioOps, PioOps, VirtMsrOps};
 
 use super::virtio::{
-    DummyVirtioDevice, VirtioDevice, VirtioMsiIrqManager, VirtioPciDevice, VIRTIO_TYPE_BLOCK,
+    DummyVirtioDevice, VirtioDevice, VirtioMsiIrqManager, VirtioPciDevice,
+    GLOBAL_VIRTIO_PCI_CFG_REQ, VIRTIO_TYPE_BLOCK,
 };
 
 const VM_EXIT_INSTR_LEN_RDMSR: u8 = 2;
@@ -75,10 +76,19 @@ impl<H: HyperCraftHal> DeviceList<H> {
         self.port_io_devices.append(devices)
     }
 
-    pub fn find_port_io_device(&self, port: u16) -> Option<&Arc<Mutex<dyn PioOps>>> {
+    pub fn find_port_io_device(&self, port: u16) -> Option<Arc<Mutex<dyn PioOps>>> {
         self.port_io_devices
             .iter()
             .find(|dev| dev.lock().port_range().contains(&port))
+            .cloned()
+            .or_else(|| {
+                if let Some(pci_host) = &self.pci_devices {
+                    let root_bus = &pci_host.lock().root_bus;
+                    root_bus.clone().lock().find_pio_bar(port)
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn add_memory_io_device(&mut self, device: Arc<Mutex<dyn MmioOps>>) {
@@ -89,10 +99,19 @@ impl<H: HyperCraftHal> DeviceList<H> {
         self.memory_io_devices.append(devices)
     }
 
-    pub fn find_memory_io_device(&self, address: u64) -> Option<&Arc<Mutex<dyn MmioOps>>> {
+    pub fn find_memory_io_device(&self, address: u64) -> Option<Arc<Mutex<dyn MmioOps>>> {
         self.memory_io_devices
             .iter()
             .find(|dev| dev.lock().mmio_range().contains(&address))
+            .cloned()
+            .or_else(|| {
+                if let Some(pci_host) = &self.pci_devices {
+                    let root_bus = &pci_host.lock().root_bus;
+                    root_bus.clone().lock().find_mmio_bar(address)
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn add_msr_device(&mut self, device: Arc<Mutex<dyn VirtMsrOps>>) {
@@ -103,16 +122,17 @@ impl<H: HyperCraftHal> DeviceList<H> {
         self.msr_devices.append(devices)
     }
 
-    pub fn find_msr_device(&self, msr: u32) -> Option<&Arc<Mutex<dyn VirtMsrOps>>> {
+    pub fn find_msr_device(&self, msr: u32) -> Option<Arc<Mutex<dyn VirtMsrOps>>> {
         self.msr_devices
             .iter()
             .find(|dev| dev.lock().msr_range().contains(&msr))
+            .cloned()
     }
 
     fn handle_io_instruction_to_device(
         vcpu: &mut VCpu<H>,
         exit_info: &VmxExitInfo,
-        device: &Arc<Mutex<dyn PioOps>>,
+        device: Arc<Mutex<dyn PioOps>>,
     ) -> HyperResult {
         let io_info = vcpu.io_exit_info().unwrap();
         trace!(
@@ -168,15 +188,39 @@ impl<H: HyperCraftHal> DeviceList<H> {
         let io_info = vcpu.io_exit_info().unwrap();
 
         if let Some(dev) = self.find_port_io_device(io_info.port) {
-            return Some(Self::handle_io_instruction_to_device(vcpu, exit_info, dev));
-        } else {
-            if self.pci_devices.is_some() {
-                let pci_host = self.pci_devices.clone().unwrap();
-                let mut root_bus = &pci_host.lock().root_bus;
-                if let Some(bar) = root_bus.clone().lock().find_pio_bar(io_info.port) {
-                    return Some(Self::handle_io_instruction_to_device(vcpu, exit_info, &bar));
+            let mut ret = Some(Self::handle_io_instruction_to_device(vcpu, exit_info, dev));
+            // deal with virtio pci cfg access cap
+            let mmio_req = GLOBAL_VIRTIO_PCI_CFG_REQ.read();
+            *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = None;
+            if let Some(req) = mmio_req.as_ref() {
+                // this mmio req can only be generated from pci config read(virtio pci cfg access cap), so do not check mmio_ops in the devicelist
+                if self.pci_devices.is_some() {
+                    let addr = req.addr;
+                    let pci_host = self.pci_devices.clone().unwrap();
+                    let mut root_bus = &pci_host.lock().root_bus;
+                    if let Some(mmio_ops) = root_bus.clone().lock().find_mmio_bar(addr) {
+                        let access_size = req.len;
+                        if req.is_write {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&(req.data)[..8]);
+                            let value = u64::from_le_bytes(bytes);
+                            let ret = Some(mmio_ops.lock().write(addr, access_size, value));
+                        } else {
+                            let value = mmio_ops.lock().read(addr, access_size).ok()?;
+                            let rax = &mut vcpu.regs_mut().rax;
+                            match access_size {
+                                1 => *rax = (*rax & !0xff) | (value & 0xff) as u64,
+                                2 => *rax = (*rax & !0xffff) | (value & 0xffff) as u64,
+                                4 => *rax = (*rax & !0xffff_ffff) | (value & 0xffff_ffff) as u64 ,
+                                8 => *rax = value,
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
                 }
             }
+            return ret;
+        } else {
             return None;
         }
     }
@@ -184,7 +228,7 @@ impl<H: HyperCraftHal> DeviceList<H> {
     fn handle_mmio_instruction_to_device(
         vcpu: &mut VCpu<H>,
         exit_info: &VmxExitInfo,
-        device: &Arc<Mutex<dyn MmioOps>>,
+        device: Arc<Mutex<dyn MmioOps>>,
     ) -> HyperResult {
         Ok(())
     }
@@ -341,8 +385,8 @@ impl<H: HyperCraftHal> PerCpuDevices<H> for X64VcpuDevices<H> {
             Arc::new(Mutex::new(device_emu::Dummy::new(0x87, 1))),  // 0x87 is a port about dma
             Arc::new(Mutex::new(device_emu::Dummy::new(0x60, 1))), // 0x60 and 0x64 are ports about ps/2 controller
             Arc::new(Mutex::new(device_emu::Dummy::new(0x64, 1))), //
-                                                                   // Arc::new(Mutex::new(device_emu::PCIConfigurationSpace::new(0xcf8))),
-                                                                   // Arc::new(Mutex::new(device_emu::PCIPassthrough::new(0xcf8))),
+            Arc::new(Mutex::new(device_emu::PCIConfigurationSpace::new(0xcf8))),
+            // Arc::new(Mutex::new(device_emu::PCIPassthrough::new(0xcf8))),
         ];
 
         devices.add_port_io_devices(&mut pmio_devices);
@@ -459,7 +503,7 @@ impl<H: HyperCraftHal> PerVmDevices<H> for X64VmDevices<H> {
         let mut devices = DeviceList::new();
         // init pci device
         devices.init_pci_host();
-        devices.add_port_io_device(devices.pci_devices.clone().unwrap());
+        // devices.add_port_io_device(devices.pci_devices.clone().unwrap());
         // Create a virtio dummy device
         let virtio_device_dummy = DummyVirtioDevice::new(VIRTIO_TYPE_BLOCK, 1, 4);
         devices.add_virtio_pci_device(

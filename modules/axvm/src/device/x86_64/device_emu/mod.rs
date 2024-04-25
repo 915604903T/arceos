@@ -7,6 +7,7 @@ mod i8259_pic;
 mod pit;
 mod port_passthrough;
 mod uart16550;
+mod pci_dummy;
 
 extern crate alloc;
 
@@ -20,6 +21,7 @@ use hypercraft::VirtMsrOps;
 pub use i8259_pic::I8259Pic;
 pub use port_passthrough::PortPassthrough;
 pub use uart16550::{MultiplexConsoleBackend, Uart16550};
+pub use pci_dummy::PCIConfigurationSpace;
 
 macro_rules! pmio_proxy_struct {
     ($port_begin:expr, $port_end:expr, $name:ident, $parent:ident, $reader:ident, $writer:ident) => {

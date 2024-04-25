@@ -1,5 +1,6 @@
-use super::PioOps;
+use hypercraft::PioOps;
 use bit_field::BitField;
+use hypercraft::{HyperError, HyperResult};
 
 pub struct PCIConfigurationSpace {
     port_base: u16,
