@@ -191,10 +191,10 @@ impl<H: HyperCraftHal> DeviceList<H> {
         if let Some(dev) = self.find_port_io_device(io_info.port) {
             let mut ret = Some(Self::handle_io_instruction_to_device(vcpu, exit_info, dev));
             // deal with virtio pci cfg access cap
-            let mmio_req = GLOBAL_VIRTIO_PCI_CFG_REQ.read();
-            *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = None;
+            let mmio_req = GLOBAL_VIRTIO_PCI_CFG_REQ.read().clone();
             if let Some(req) = mmio_req.as_ref() {
                 // this mmio req can only be generated from pci config read(virtio pci cfg access cap), so do not check mmio_ops in the devicelist
+                *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = None;
                 if self.pci_devices.is_some() {
                     let addr = req.addr;
                     let pci_host = self.pci_devices.clone().unwrap();
@@ -216,6 +216,7 @@ impl<H: HyperCraftHal> DeviceList<H> {
                                 8 => *rax = value,
                                 _ => unreachable!(),
                             }
+                            ret = Some(Ok(()))
                         }
                     }
                 }
