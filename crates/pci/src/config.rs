@@ -437,10 +437,6 @@ pub struct PciConfig {
     pub last_ext_cap_end: u16,
     /// MSI-X information.
     pub msix: Option<Arc<Mutex<Msix>>>,
-    /// PIO Bars of virtio device
-    pub pios: HashMap<Range<u16>, Arc<Mutex<dyn PioOps>>>,
-    /// MMIO Bars of virtio device
-    pub mmios: HashMap<Range<u64>, Arc<Mutex<dyn MmioOps>>>,
 }
 
 impl PciConfig {
@@ -470,8 +466,6 @@ impl PciConfig {
             last_ext_cap_offset: 0,
             last_ext_cap_end: PCI_CONFIG_SPACE_SIZE as u16,
             msix: None,
-            pios: HashMap::new(),
-            mmios: HashMap::new(),
         }
     }
 
@@ -827,12 +821,10 @@ impl PciConfig {
                     RegionType::Io => {
                         let range = (self.bars[id].address as u16)
                             ..(self.bars[id].address + self.bars[id].size) as u16;
-                        self.remove_pio(range);
                     }
                     _ => {
                         let range =
                             self.bars[id].address..self.bars[id].address + self.bars[id].size;
-                        self.remove_mmio(range);
                     }
                 }
                 self.bars[id].address = BAR_SPACE_UNMAPPED;
@@ -845,33 +837,9 @@ impl PciConfig {
             // map new region
             if new_addr != BAR_SPACE_UNMAPPED {
                 self.bars[id].address = new_addr;
-                match self.bars[id].region_type {
-                    #[cfg(target_arch = "x86_64")]
-                    RegionType::Io => {
-                        // get the self bars[id], and update the address variable. insert it to pios
-                        let range = (new_addr as u16)..(new_addr + self.bars[id].size) as u16;
-                        self.add_pio(range, Arc::new(Mutex::new(self.bars[id].clone())));
-                    }
-                    _ => {
-                        let range = (new_addr as u64)..(new_addr + self.bars[id].size) as u64;
-                        self.add_mmio(range, Arc::new(Mutex::new(self.bars[id].clone())));
-                    }
-                }
             }
         }
         Ok(())
-    }
-
-    /// Add a new PIO BAR to the configuration space.
-    pub fn add_pio(&mut self, range: Range<u16>, pio: Arc<Mutex<dyn PioOps>>) {
-        self.pios.insert(range, pio);
-    }
-
-    /// Remove a PIO BAR from the configuration space.
-    pub fn remove_pio(&mut self, range: Range<u16>) {
-        if self.pios.contains_key(&range) {
-            self.pios.remove(&range);
-        }
     }
 
     /// Find a PIO BAR by Port.
@@ -879,18 +847,6 @@ impl PciConfig {
         self.bars
             .iter()
             .find(|bar| bar.region_type == RegionType::Io && bar.port_range().contains(&port))
-    }
-
-    /// Add a new MMIO BAR to the configuration space.
-    pub fn add_mmio(&mut self, range: Range<u64>, mmio: Arc<Mutex<dyn MmioOps>>) {
-        self.mmios.insert(range, mmio);
-    }
-
-    /// Remove a MMIO BAR from the configuration space.
-    pub fn remove_mmio(&mut self, range: Range<u64>) {
-        if self.mmios.contains_key(&range) {
-            self.mmios.remove(&range);
-        }
     }
 
     /// Find a MMIO BAR by Address.
