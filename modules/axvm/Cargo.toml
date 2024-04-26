@@ -43,7 +43,7 @@ pci = { path = "../../crates/pci" }
 version = "1.21.0"
 default-features = false
 # See below for all features
-features = ["no_std", "decoder", "masm", "instr_info"]
+features = ["no_std", "decoder", "masm", "instr_info", "op_code_info"]
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86 = "0.52"

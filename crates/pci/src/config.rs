@@ -588,7 +588,7 @@ impl PciConfig {
 
         Ok(())
     }
-    
+
     /// # Arguments
     ///
     /// * `offset` - Offset in the configuration space from which to write.
@@ -794,33 +794,14 @@ impl PciConfig {
     /// * `bus` - The bus which region registered.
     pub fn unregister_bars(&mut self, _bus: &Arc<Mutex<PciBus>>) -> Result<()> {
         // let locked_bus = bus.lock();
-        let mut pio_ranges_to_remove = Vec::new();
-        let mut mmio_ranges_to_remove = Vec::new();
-
         for bar in self.bars.iter_mut() {
             if bar.address == BAR_SPACE_UNMAPPED || bar.size == 0 {
                 continue;
             }
-            match bar.region_type {
-                RegionType::Io => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        pio_ranges_to_remove
-                            .push(bar.address as u16..(bar.address + bar.size) as u16);
-                    }
-                }
-                _ => {
-                    mmio_ranges_to_remove.push(bar.address..(bar.address + bar.size));
-                }
-            }
+            // Invalid the bar region
+            bar.address = BAR_SPACE_UNMAPPED;
+            bar.size = 0;
             bar.ops = None;
-        }
-        for range in pio_ranges_to_remove {
-            self.remove_pio(range);
-        }
-
-        for range in mmio_ranges_to_remove {
-            self.remove_mmio(range);
         }
 
         Ok(())
@@ -896,10 +877,10 @@ impl PciConfig {
     /// Find a PIO BAR by Port.
     pub fn find_pio(&self, port: u16) -> Option<&Bar> {
         self.bars
-        .iter()
-        .find(|bar| bar.port_range().contains(&port))
+            .iter()
+            .find(|bar| bar.region_type == RegionType::Io && bar.port_range().contains(&port))
     }
-    
+
     /// Add a new MMIO BAR to the configuration space.
     pub fn add_mmio(&mut self, range: Range<u64>, mmio: Arc<Mutex<dyn MmioOps>>) {
         self.mmios.insert(range, mmio);
@@ -911,14 +892,15 @@ impl PciConfig {
             self.mmios.remove(&range);
         }
     }
-    
+
     /// Find a MMIO BAR by Address.
     pub fn find_mmio(&self, addr: u64) -> Option<&Bar> {
-        self.bars
-        .iter()
-        .find(|bar| bar.mmio_range().contains(&addr))
+        self.bars.iter().find(|bar| {
+            bar.region_type == RegionType::Mem64Bit
+                || bar.region_type == RegionType::Mem32Bit && bar.mmio_range().contains(&addr)
+        })
     }
-    
+
     /// Add a pci standard capability in the configuration space.
     ///
     /// # Arguments

@@ -8,8 +8,8 @@ use core::any::Any;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU16, Ordering};
-use spin::{mutex, Mutex, rwlock::RwLock};
 use lazy_static::lazy_static;
+use spin::{mutex, rwlock::RwLock, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -131,12 +131,7 @@ pub struct MmioReq {
 }
 
 impl MmioReq {
-    fn new(
-        data: Vec<u8>,
-        len: u8,
-        addr: u64,
-        is_write: bool,
-    ) -> Self {
+    fn new(data: Vec<u8>, len: u8, addr: u64, is_write: bool) -> Self {
         MmioReq {
             data,
             len,

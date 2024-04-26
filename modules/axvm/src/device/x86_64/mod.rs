@@ -7,6 +7,7 @@ use crate::{
 };
 use crate::{Error as HyperError, GuestPageTable, VmExitInfo as VmxExitInfo};
 use alloc::string::String;
+use alloc::format;
 use alloc::{sync::Arc, vec, vec::Vec};
 use axhal::{current_cpu_id, mem::phys_to_virt};
 use bit_field::BitField;
@@ -211,7 +212,7 @@ impl<H: HyperCraftHal> DeviceList<H> {
                             match access_size {
                                 1 => *rax = (*rax & !0xff) | (value & 0xff) as u64,
                                 2 => *rax = (*rax & !0xffff) | (value & 0xffff) as u64,
-                                4 => *rax = (*rax & !0xffff_ffff) | (value & 0xffff_ffff) as u64 ,
+                                4 => *rax = (*rax & !0xffff_ffff) | (value & 0xffff_ffff) as u64,
                                 8 => *rax = value,
                                 _ => unreachable!(),
                             }
@@ -229,8 +230,90 @@ impl<H: HyperCraftHal> DeviceList<H> {
         vcpu: &mut VCpu<H>,
         exit_info: &VmxExitInfo,
         device: Arc<Mutex<dyn MmioOps>>,
+        instr: Option<Instruction>,
     ) -> HyperResult {
-        Ok(())
+        if let Some(instr) = instr {
+            if let ept_info = vcpu
+                .nested_page_fault_info()
+                .expect("Failed to get nested page fault info")
+            {
+                let fault_addr = ept_info.fault_guest_paddr as u64;
+                let is_write = ept_info.access_flags.contains(MappingFlags::WRITE);
+                let access_size =
+                    get_access_size(instr.clone()).expect("Failed to get access size");
+                let (op_kind, op) = get_instr_data(instr.clone(), is_write)
+                    .expect("Failed to get instruction data");
+                if let Some(operand) = op {
+                    if is_write {
+                        let value = match op_kind {
+                            OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate64 => {
+                                operand.parse::<u64>().unwrap()
+                            }
+                            OpKind::Register => {
+                                match operand {
+                                    _ if operand.contains("a") => vcpu.regs().rax,
+                                    _ if operand.contains("b") => vcpu.regs().rbx,
+                                    _ if operand.contains("c") => vcpu.regs().rcx,
+                                    _ if operand.contains("d") => vcpu.regs().rdx,
+                                    _ if operand.contains("si") => vcpu.regs().rsi,
+                                    _ if operand.contains("di") => vcpu.regs().rdi,
+                                    _ if operand.contains("bp") => vcpu.regs().rbp,
+                                    _ if operand.contains("r8") => vcpu.regs().r8,
+                                    _ if operand.contains("r9") => vcpu.regs().r9,
+                                    _ if operand.contains("r10") => vcpu.regs().r10,
+                                    _ if operand.contains("r11") => vcpu.regs().r11,
+                                    _ if operand.contains("r12") => vcpu.regs().r12,
+                                    _ if operand.contains("r13") => vcpu.regs().r13,
+                                    _ if operand.contains("r14") => vcpu.regs().r14,
+                                    _ if operand.contains("r15") => vcpu.regs().r15,
+                                    _ => return Err(HyperError::InvalidParam),
+                                }
+                            }
+                            _ => return Err(HyperError::InvalidParam),
+                        };
+                        device.lock().write(fault_addr, access_size, value)?;
+                    } else {
+                        let value = device.lock().read(fault_addr, access_size)?;
+                        if op_kind != OpKind::Register {
+                            return Err(HyperError::InvalidParam);
+                        }
+                        // not consider segment register
+                        let reg = match operand {
+                            _ if operand.contains("a") => &mut vcpu.regs_mut().rax,
+                            _ if operand.contains("b") => &mut vcpu.regs_mut().rbx,
+                            _ if operand.contains("c") => &mut vcpu.regs_mut().rcx,
+                            _ if operand.contains("d") => &mut vcpu.regs_mut().rdx,
+                            _ if operand.contains("si") => &mut vcpu.regs_mut().rsi,
+                            _ if operand.contains("di") => &mut vcpu.regs_mut().rdi,
+                            _ if operand.contains("bp") => &mut vcpu.regs_mut().rbp,
+                            _ if operand.contains("r8") => &mut vcpu.regs_mut().r8,
+                            _ if operand.contains("r9") => &mut vcpu.regs_mut().r9,
+                            _ if operand.contains("r10") => &mut vcpu.regs_mut().r10,
+                            _ if operand.contains("r11") => &mut vcpu.regs_mut().r11,
+                            _ if operand.contains("r12") => &mut vcpu.regs_mut().r12,
+                            _ if operand.contains("r13") => &mut vcpu.regs_mut().r13,
+                            _ if operand.contains("r14") => &mut vcpu.regs_mut().r14,
+                            _ if operand.contains("r15") => &mut vcpu.regs_mut().r15,
+                            _ => return Err(HyperError::InvalidParam),
+                        };
+                        match access_size {
+                            1 => *reg = (*reg & !0xff) | (value & 0xff) as u64,
+                            2 => *reg = (*reg & !0xffff) | (value & 0xffff) as u64,
+                            4 => *reg = (*reg & !0xffff_ffff) | (value & 0xffff_ffff) as u64,
+                            8 => *reg = value,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                return Ok(());
+            } else {
+                panic!(
+                    "VM exit: EPT violation with unknown fault info @ {:#x}, vcpu: {:#x?}",
+                    exit_info.guest_rip, vcpu
+                );
+            }
+        }
+        Err(HyperError::InvalidInstruction)
     }
 
     pub fn handle_mmio_instruction(
@@ -239,54 +322,25 @@ impl<H: HyperCraftHal> DeviceList<H> {
         exit_info: &VmxExitInfo,
         instr: Option<Instruction>,
     ) -> Option<HyperResult> {
-        if let Some(instr) = instr {
-            if let ept_info = vcpu
-                .nested_page_fault_info()
-                .expect("Failed to get nested page fault info")
-            {
-                let is_write = ept_info.access_flags.contains(MappingFlags::WRITE);
-                let fault_addr = ept_info.fault_guest_paddr;
-                let access_size =
-                    get_access_size(instr.clone()).expect("Failed to get access size");
-                return None;
-            } else {
-                panic!(
-                    "VM exit: EPT violation with unknown fault info @ {:#x}, vcpu: {:#x?}",
-                    exit_info.guest_rip, vcpu
+        match vcpu.nested_page_fault_info() {
+            Ok(fault_info) => {
+                debug!(
+                    "VM exit: EPT violation @ {:#x}, fault_paddr={:#x}, access_flags=({:?}), vcpu: {:#x?}",
+                    exit_info.guest_rip, fault_info.fault_guest_paddr, fault_info.access_flags, vcpu
                 );
+
+                if let Some(dev) = self.find_memory_io_device(fault_info.fault_guest_paddr as u64) {
+                    return Some(Self::handle_mmio_instruction_to_device(
+                        vcpu, exit_info, dev, instr,
+                    ));
+                }
+                return Some(Ok(()));
             }
-        } else {
-            return None;
+            Err(_err) => panic!(
+                "VM exit: EPT violation with unknown fault info @ {:#x}, vcpu: {:#x?}",
+                exit_info.guest_rip, vcpu
+            ),
         }
-
-        // match vcpu.nested_page_fault_info() {
-        //     Ok(fault_info) =>  {
-        //         debug!(
-        //             "VM exit: EPT violation @ {:#x}, fault_paddr={:#x}, access_flags=({:?}), vcpu: {:#x?}",
-        //             exit_info.guest_rip, fault_info.fault_guest_paddr, fault_info.access_flags, vcpu
-        //         );
-        //         // todo: get mmio info
-        //         let mmio_info = vcpu.io_exit_info().unwrap();
-
-        //         if let Some(dev) = self.find_memory_io_device() {
-        //             return Some(Self::handle_mmio_instruction_to_device(vcpu, exit_info, dev));
-        //         } else {
-        //             if self.pci_devices.is_some() {
-        //                 let pci_host = self.pci_devices.clone().unwrap();
-        //                 let mut root_bus = pci_host.lock().root_bus.clone();
-        //                 if let Some(bar) = root_bus.find_mmio_bar() {
-        //                     return Some(Self::handle_mmio_instruction_to_device(vcpu, exit_info, dev));
-        //                 }
-        //             }
-        //             return None;
-        //         }
-        //         Some(Ok(()))
-        //     }
-        //     Err(_err) => panic!(
-        //         "VM exit: EPT violation with unknown fault info @ {:#x}, vcpu: {:#x?}",
-        //         exit_info.guest_rip, vcpu
-        //     ),
-        // }
         None
     }
 
@@ -572,7 +626,41 @@ fn get_access_size(instruction: Instruction) -> HyperResult<u8> {
     }
 }
 
-fn get_write_data(instruction: Instruction) -> HyperResult<u64> {
-    // TODO
-    Ok(0)
+fn get_instr_data(
+    instruction: Instruction,
+    is_write: bool,
+) -> HyperResult<(OpKind, Option<String>)> {
+    let op_code = instruction.op_code();
+    match op_code.op_code_string() {
+        s if s.contains("mov") => get_mov_data(instruction, is_write),
+        _ => {
+            error!("unrealized instruction:{:?}", op_code);
+            return Err(HyperError::InstructionNotSupported);
+        }
+    };
+    Err(HyperError::InstructionNotSupported)
+}
+
+fn get_mov_data(instruction: Instruction, is_write: bool) -> HyperResult<(OpKind, Option<String>)> {
+    // mov dest, src
+    let op_kind = if is_write {
+        instruction.op1_kind()
+    } else {
+        instruction.op0_kind()
+    };
+    match op_kind {
+        OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate64 => {
+            Ok((op_kind, Some(format!("{:?}", instruction.immediate64()))))
+        }
+        OpKind::Register => {
+            let reg = if is_write {
+                instruction.op1_register()
+            } else {
+                instruction.op0_register()
+            };
+            Ok((op_kind, Some(format!("{:?}", reg))))
+        }
+        _ => Err(HyperError::OperandNotSupported),
+    };
+    Err(HyperError::OperandNotSupported)
 }
