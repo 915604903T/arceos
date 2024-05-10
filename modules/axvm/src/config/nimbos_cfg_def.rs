@@ -13,13 +13,13 @@ pub fn nimbos_memory_regions_setup(regions: &mut Vec<GuestMemoryRegion>) {
             size: 0x0100_0000,
             flags: MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
         },
-        GuestMemoryRegion {
-            // PCI
-            gpa: 0x8000_0000,
-            hpa: 0x8000_0000,
-            size: 0x1000_0000,
-            flags: MappingFlags::READ | MappingFlags::WRITE,
-        },
+        // GuestMemoryRegion {
+        //     // PCI
+        //     gpa: 0x8000_0000,
+        //     hpa: 0x8000_0000,
+        //     size: 0x1000_0000,
+        //     flags: MappingFlags::READ | MappingFlags::WRITE,
+        // },
         // GuestMemoryRegion {
         //     gpa: 0xfe00_0000,
         //     hpa: 0xfe00_0000,

@@ -10,6 +10,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU16, Ordering};
 use lazy_static::lazy_static;
 use spin::{mutex, rwlock::RwLock, Mutex};
+use x86_64::registers::debug;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -25,9 +26,10 @@ use crate::device::virtio::{
 };
 use hypercraft::{HyperError, HyperResult, MmioOps, PciError, PioOps, RegionOps, VirtioError};
 use pci::config::{
-    RegionType, BAR_SPACE_UNMAPPED, DEVICE_ID, MINIMUM_BAR_SIZE_FOR_MMIO, PCIE_CONFIG_SPACE_SIZE,
-    PCI_SUBDEVICE_ID_QEMU, PCI_VENDOR_ID_REDHAT_QUMRANET, REG_SIZE, REVISION_ID, STATUS,
-    STATUS_INTERRUPT, SUBSYSTEM_ID, SUBSYSTEM_VENDOR_ID, SUB_CLASS_CODE, VENDOR_ID,
+    BarAllocTrait, RegionType, BAR_SPACE_UNMAPPED, DEVICE_ID, MINIMUM_BAR_SIZE_FOR_MMIO,
+    PCIE_CONFIG_SPACE_SIZE, PCI_SUBDEVICE_ID_QEMU, PCI_VENDOR_ID_REDHAT_QUMRANET, REG_SIZE,
+    REVISION_ID, STATUS, STATUS_INTERRUPT, SUBSYSTEM_ID, SUBSYSTEM_VENDOR_ID, SUB_CLASS_CODE,
+    VENDOR_ID,
 };
 use pci::offset_of;
 use pci::util::{
@@ -35,8 +37,9 @@ use pci::util::{
     num_ops::{ranges_overlap, read_data_u32, write_data_u32},
 };
 use pci::{
-    config::PciConfig, init_msix, init_multifunction, le_write_u16, le_write_u32, AsAny, PciBus,
-    PciDevBase, PciDevOps,
+    config::{PciConfig, PCI_CAP_ID_VNDR, PCI_CAP_VNDR_AND_NEXT_SIZE},
+    init_msix, init_multifunction, le_write_u16, le_write_u32, AsAny, PciBus, PciDevBase,
+    PciDevOps,
 };
 
 const VIRTIO_QUEUE_MAX: u32 = 1024;
@@ -65,9 +68,6 @@ const VIRTIO_PCI_CAP_NOTIFY_OFF_MULTIPLIER: u32 = 4;
 const VIRTIO_PCI_BAR_MAX: u8 = 3;
 const VIRTIO_PCI_MSIX_BAR_IDX: u8 = 1;
 const VIRTIO_PCI_MEM_BAR_IDX: u8 = 2;
-
-const PCI_CAP_VNDR_AND_NEXT_SIZE: u8 = 2;
-const PCI_CAP_ID_VNDR: u8 = 0x9;
 
 /// Device (host) features set selector - Read Write.
 const COMMON_DFSELECT_REG: u64 = 0x0;
@@ -255,8 +255,8 @@ impl VirtioPciNotifyCap {
 
 /// Virtio-PCI device structure
 #[derive(Clone)]
-pub struct VirtioPciDevice {
-    base: PciDevBase,
+pub struct VirtioPciDevice<B: BarAllocTrait> {
+    base: PciDevBase<B>,
     /// The entity of virtio device
     device: Arc<Mutex<dyn VirtioDevice>>,
     /// Device id
@@ -267,19 +267,19 @@ pub struct VirtioPciDevice {
     interrupt_cb: Option<Arc<VirtioInterrupt>>,
 }
 
-impl VirtioPciDevice {
+impl<B: BarAllocTrait + 'static> VirtioPciDevice<B> {
     pub fn new(
         name: String,
         devfn: u8,
         device: Arc<Mutex<dyn VirtioDevice>>,
-        parent_bus: Weak<Mutex<PciBus>>,
+        parent_bus: Weak<Mutex<PciBus<B>>>,
         multi_func: bool,
     ) -> Self {
         let queue_num = device.lock().queue_num();
         VirtioPciDevice {
             base: PciDevBase {
                 id: name,
-                config: PciConfig::new(PCIE_CONFIG_SPACE_SIZE, VIRTIO_PCI_BAR_MAX),
+                config: PciConfig::<B>::new(PCIE_CONFIG_SPACE_SIZE, VIRTIO_PCI_BAR_MAX),
                 devfn,
                 parent_bus,
             },
@@ -615,10 +615,10 @@ impl VirtioPciDevice {
     }
 
     // build pci cfg cap ops(common_cfg, isr_cfg, device_cfg, notify_cfg)
-    fn build_pci_cfg_cap_ops(virtio_pci: Arc<Mutex<VirtioPciDevice>>) -> RegionOps {
+    fn build_pci_cfg_cap_ops(virtio_pci: Arc<Mutex<VirtioPciDevice<B>>>) -> RegionOps {
         let cloned_virtio_pci = virtio_pci.clone();
-        let read = move |offset: u64, access_size: u8| -> HyperResult<u32> {
-            let mut data = [0u8; 4];
+        let read = move |offset: u64, access_size: u8| -> HyperResult<u64> {
+            let mut data = [0u8; 8];
             match offset as u32 {
                 // read pci common cfg
                 VIRTIO_PCI_CAP_COMMON_OFFSET..VIRTIO_PCI_CAP_ISR_OFFSET => {
@@ -668,7 +668,7 @@ impl VirtioPciDevice {
                     return Err(HyperError::InValidMmioRead);
                 }
             };
-            Ok(u32::from_le_bytes(data))
+            Ok(u64::from_le_bytes(data))
         };
         let cloned_virtio_pci = virtio_pci.clone();
         let write = move |offset: u64, access_size: u8, data: &[u8]| -> HyperResult {
@@ -768,7 +768,7 @@ impl VirtioPciDevice {
             warn!("The access range of VirtioPciCfgAccessCap exceeds bar size");
             return None;
         }
-        let mut data = self.base.config.config[pci_cfg_data_offset..].as_ref();
+        let data = self.base.config.config[pci_cfg_data_offset..].as_ref();
         let mmio_req = MmioReq::new(data.to_vec(), len as u8, (bar_base + off as u64), is_write);
         Some(mmio_req)
 
@@ -802,7 +802,7 @@ impl VirtioPciDevice {
     }
 }
 
-impl AsAny for VirtioPciDevice {
+impl<B: BarAllocTrait + 'static> AsAny for VirtioPciDevice<B> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -812,16 +812,16 @@ impl AsAny for VirtioPciDevice {
     }
 }
 
-impl PciDevOps for VirtioPciDevice {
+impl<B: BarAllocTrait + 'static> PciDevOps<B> for VirtioPciDevice<B> {
     fn name(&self) -> String {
         self.base.id.clone()
     }
 
-    fn pci_base(&self) -> &PciDevBase {
+    fn pci_base(&self) -> &PciDevBase<B> {
         &self.base
     }
 
-    fn pci_base_mut(&mut self) -> &mut PciDevBase {
+    fn pci_base_mut(&mut self) -> &mut PciDevBase<B> {
         &mut self.base
     }
 
@@ -979,6 +979,11 @@ impl PciDevOps for VirtioPciDevice {
     }
 
     fn read_config(&mut self, offset: usize, data: &mut [u8]) {
+        debug!(
+            "Read pci config space at offset {:#x} with data size {}",
+            offset,
+            data.len()
+        );
         let mmio_req = self.do_cfg_access(offset, offset + data.len(), false);
         if mmio_req.is_some() {
             *GLOBAL_VIRTIO_PCI_CFG_REQ.write() = mmio_req;
@@ -988,6 +993,11 @@ impl PciDevOps for VirtioPciDevice {
     }
 
     fn write_config(&mut self, offset: usize, data: &[u8]) {
+        debug!(
+            "Write pci config space at offset {:#x} with data size {}",
+            offset,
+            data.len()
+        );
         let data_size = data.len();
         let end = offset + data_size;
         if end > PCIE_CONFIG_SPACE_SIZE || data_size > REG_SIZE {

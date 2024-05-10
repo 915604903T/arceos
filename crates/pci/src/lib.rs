@@ -19,6 +19,7 @@ pub use config::{PciConfig, INTERRUPT_PIN};
 pub use host::PciHost;
 pub use msix::*;
 
+pub use crate::config::BarAllocTrait;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::mem::size_of;
@@ -28,7 +29,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::config::{HEADER_TYPE, HEADER_TYPE_MULTIFUNC, MAX_FUNC};
 pub use crate::util::AsAny;
-use hypercraft::{HyperResult as Result, HyperError};
+use hypercraft::{HyperError, HyperResult as Result};
 
 // const BDF_FUNC_SHIFT: u8 = 3;
 pub const PCI_SLOT_MAX: u8 = 32;
@@ -152,26 +153,26 @@ pub fn pci_ext_cap_next(header: u32) -> usize {
 }
 
 #[derive(Clone)]
-pub struct PciDevBase {
+pub struct PciDevBase<B: BarAllocTrait> {
     /// Name of this device
     pub id: String,
     /// Pci config space.
-    pub config: PciConfig,
+    pub config: PciConfig<B>,
     /// Devfn.
     pub devfn: u8,
     /// Primary Bus.
-    pub parent_bus: Weak<Mutex<PciBus>>,
+    pub parent_bus: Weak<Mutex<PciBus<B>>>,
 }
 
-pub trait PciDevOps: Send + AsAny {
+pub trait PciDevOps<B: BarAllocTrait>: Send + AsAny {
     /// Get device name.
     fn name(&self) -> String;
 
     /// Get base property of pci device.
-    fn pci_base(&self) -> &PciDevBase;
+    fn pci_base(&self) -> &PciDevBase<B>;
 
     /// Get mutable base property of pci device.
-    fn pci_base_mut(&mut self) -> &mut PciDevBase;
+    fn pci_base_mut(&mut self) -> &mut PciDevBase<B>;
 
     /// Init writable bit mask.
     fn init_write_mask(&mut self, is_bridge: bool) -> Result<()> {
@@ -240,7 +241,7 @@ pub trait PciDevOps: Send + AsAny {
     }
 
     /// Get the path of the PCI bus where the device resides.
-    fn get_parent_dev_path(&self, parent_bus: Arc<Mutex<PciBus>>) -> String {
+    fn get_parent_dev_path(&self, parent_bus: Arc<Mutex<PciBus<B>>>) -> String {
         let locked_parent_bus = parent_bus.lock();
         let parent_dev_path = if locked_parent_bus.name.eq("pcie.0") {
             String::from("/pci@ffffffffffffffff")
@@ -301,11 +302,11 @@ pub trait PciDevOps: Send + AsAny {
 /// * `config` - Configuration space of pci devices.
 /// * `devfn` - Devfn number.
 /// * `parent_bus` - Parent bus of pci devices.
-pub fn init_multifunction(
+pub fn init_multifunction<B: BarAllocTrait>(
     multifunction: bool,
     config: &mut [u8],
     devfn: u8,
-    parent_bus: Weak<Mutex<PciBus>>,
+    parent_bus: Weak<Mutex<PciBus<B>>>,
 ) -> Result<()> {
     let mut header_type =
         le_read_u16(config, HEADER_TYPE as usize)? & (!HEADER_TYPE_MULTIFUNC as u16);

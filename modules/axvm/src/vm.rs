@@ -6,14 +6,14 @@ use hypercraft::{PerCpu, VCpu, VmCpus, VM};
 
 use super::arch::new_vcpu;
 #[cfg(target_arch = "x86_64")]
-use super::device::{self, X64VcpuDevices, X64VmDevices};
-use crate::mm::get_gva_content_bytes;
+use super::device::{self, X64VcpuDevices, X64VmDevices, NimbosVmDevices};
 use crate::GuestPageTable;
 use alloc::sync::Arc;
 use axhal::hv::HyperCraftHalImpl;
 use axhal::mem::PAGE_SIZE_4K;
 
 use crate::config::entry::vm_cfg_entry;
+use crate::device::BarAllocImpl;
 
 // use super::type1_5::cell;
 static INIT_GPM_OK: AtomicU32 = AtomicU32::new(0);
@@ -49,13 +49,13 @@ pub fn config_boot_linux(hart_id: usize, linux_context: &LinuxContext) {
         &linux_context,
     )
     .unwrap();
-    let mut vcpus = VmCpus::<HyperCraftHalImpl, X64VcpuDevices<HyperCraftHalImpl>>::new();
+    let mut vcpus = VmCpus::<HyperCraftHalImpl, X64VcpuDevices<HyperCraftHalImpl, BarAllocImpl>>::new();
     info!("CPU{} add vcpu to vm...", hart_id);
     vcpus.add_vcpu(vcpu).expect("add vcpu failed");
     let mut vm = VM::<
         HyperCraftHalImpl,
-        X64VcpuDevices<HyperCraftHalImpl>,
-        X64VmDevices<HyperCraftHalImpl>,
+        X64VcpuDevices<HyperCraftHalImpl, BarAllocImpl>,
+        X64VmDevices<HyperCraftHalImpl, BarAllocImpl>,
         GuestPageTable,
     >::new(vcpus, Arc::new(ept));
     // The bind_vcpu method should be decoupled with vm struct.
@@ -98,12 +98,12 @@ pub fn boot_vm(vm_id: usize) {
         npt_root,
     )
     .unwrap();
-    let mut vcpus = VmCpus::<HyperCraftHalImpl, X64VcpuDevices<HyperCraftHalImpl>>::new();
+    let mut vcpus = VmCpus::<HyperCraftHalImpl, X64VcpuDevices<HyperCraftHalImpl, BarAllocImpl>>::new();
     vcpus.add_vcpu(vcpu).expect("add vcpu failed");
     let mut vm = VM::<
         HyperCraftHalImpl,
-        X64VcpuDevices<HyperCraftHalImpl>,
-        X64VmDevices<HyperCraftHalImpl>,
+        X64VcpuDevices<HyperCraftHalImpl, BarAllocImpl>,
+        NimbosVmDevices<HyperCraftHalImpl, BarAllocImpl>,
         GuestPageTable,
     >::new(vcpus, Arc::new(npt));
     // The bind_vcpu method should be decoupled with vm struct.

@@ -4,15 +4,32 @@ use crate::{
     le_read_u16, le_read_u32, le_read_u64, le_write_u16, le_write_u32, le_write_u64,
     pci_ext_cap_next, PciBus,
 };
+use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::ops::Range;
+use core::ptr::{read, write};
 use hashbrown::HashMap;
 use hypercraft::{HyperError, HyperResult as Result, PciError};
 use hypercraft::{HyperResult, MmioOps, PioOps, RegionOps};
+use lazy_static::lazy_static;
 use spin::Mutex;
+
+/// The mem64 base of emulated PCI devices bars.
+pub const PCI_EMUL_MEMBASE64: u64 = 0x4000_0000_0000; /* 256GB */
+/// The mem64 limit of emulated PCI devices bars.
+pub const PCI_EMUL_MEMLIMIT64: u64 = 0x8000_0000_0000; /* 512GB */
+/// The mem32 base of emulated PCI devices bars.
+pub const PCI_EMUL_MEMBASE32: u64 = 0x8000_0000; /* 2GB */
+/// The mem32 limit of emulated PCI devices bars.
+pub const PCI_EMUL_MEMLIMIT32: u64 = 0xE000_0000; /* 3.5GB */
+/// The io base of emulated PCI devices bars.
+pub const PCI_EMUL_IOBASE: u64 = 0x2000;
+/// The io limit of emulated PCI devices bars.
+pub const PCI_EMUL_IOLIMIT: u64 = 0x10000;
 
 /// Size in bytes of the configuration space of legacy PCI device.
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
@@ -41,6 +58,8 @@ pub const HEADER_TYPE: u8 = 0x0e;
 pub const BAR_0: u8 = 0x10;
 /// Base address register 5.
 pub const BAR_5: u8 = 0x24;
+pub const PCI_CAP_VNDR_AND_NEXT_SIZE: u8 = 2;
+pub const PCI_CAP_ID_VNDR: u8 = 0x9;
 /// Secondary bus number register.
 pub const SECONDARY_BUS_NUM: u8 = 0x19;
 /// Subordinate bus number register.
@@ -298,6 +317,12 @@ pub const PCI_CLASS_MEMORY_RAM: u16 = 0x0500;
 pub const PCI_CLASS_SERIAL_USB: u16 = 0x0c03;
 pub const PCI_CLASS_SYSTEM_OTHER: u16 = 0x0880;
 
+// Pci Bar Alloctor for virtual pci devices.
+lazy_static! {
+    pub static ref PCI_BAR_ALLOCATOR: Arc<Mutex<PciBarAllocator>> =
+        Arc::new(Mutex::new(PciBarAllocator::new()));
+}
+
 /// Type of bar region.
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum RegionType {
@@ -320,11 +345,19 @@ impl core::fmt::Display for RegionType {
     }
 }
 
+/// Bar allocator trait.
+pub trait BarAllocTrait: Sized + Send + Sync + Clone {
+    fn alloc(region_type: RegionType, size: u64) -> HyperResult<u64>;
+    fn dealloc(region_type: RegionType, addr: u64, size: u64) -> HyperResult<()>;
+}
+
 /// Registered bar.
 #[derive(Clone)]
 pub struct Bar {
     region_type: RegionType,
     address: u64,
+    // use host virtual address to get data
+    actual_address: u64,
     pub size: u64,
     ops: Option<RegionOps>,
 }
@@ -361,28 +394,161 @@ impl MmioOps for Bar {
     }
 
     fn read(&mut self, addr: u64, access_size: u8) -> hypercraft::HyperResult<u64> {
-        let offset = addr - self.address;
-        let read_func = &*self.ops.as_ref().unwrap().read;
-        let ret = read_func(offset, access_size)?;
-        Ok(ret as u64)
+        // debug!("this is mmio read addr:{:#x}", addr);
+        if self.ops.is_some() {
+            let offset = addr - self.address;
+            let read_func = &*self.ops.as_ref().unwrap().read;
+            let ret = read_func(offset, access_size)?;
+            Ok(ret)
+        } else {
+            let offset = addr - self.address;
+            let actual_addr = self.actual_address + offset;
+            // debug!(
+            //     "read this is ops is none offset:{:#x} actual_addr:{:#x}",
+            //     offset, actual_addr
+            // );
+            let data = match access_size {
+                1 => unsafe { read(actual_addr as *const u8) as u64 },
+                2 => unsafe { read(actual_addr as *const u16) as u64 },
+                4 => unsafe { read(actual_addr as *const u32) as u64 },
+                8 => unsafe { read(actual_addr as *const u64) },
+                _ => return Err(HyperError::InValidMmioRead),
+            };
+            // debug!("read data:{:#x}", data);
+            Ok(data)
+        }
     }
 
     fn write(&mut self, addr: u64, access_size: u8, value: u64) -> hypercraft::HyperResult {
-        let offset = addr - self.address;
-        let write_func = &*self.ops.as_ref().unwrap().write;
-        let value_bytes = value.to_le_bytes();
-        let value_byte: &[u8] = match access_size {
-            1 => &value_bytes[0..1],
-            2 => &value_bytes[0..2],
-            4 => &value_bytes[0..4],
-            _ => return Err(HyperError::InValidMmioWrite),
+        // debug!("this is mmio write addr:{:#x}", addr);
+        if self.ops.is_some() {
+            let offset = addr - self.address;
+            let write_func = &*self.ops.as_ref().unwrap().write;
+            let value_bytes = value.to_le_bytes();
+            let value_byte: &[u8] = match access_size {
+                1 => &value_bytes[0..1],
+                2 => &value_bytes[0..2],
+                4 => &value_bytes[0..4],
+                _ => return Err(HyperError::InValidMmioWrite),
+            };
+            write_func(offset, access_size, value_byte)
+        } else {
+            let offset = addr - self.address;
+            let actual_addr = self.actual_address + offset;
+            // debug!("write this is ops is none offset:{:#x}", offset);
+            match access_size {
+                1 => unsafe { write(actual_addr as *mut u8, value as u8) },
+                2 => unsafe { write(actual_addr as *mut u16, value as u16) },
+                4 => unsafe { write(actual_addr as *mut u32, value as u32) },
+                8 => unsafe { write(actual_addr as *mut u64, value) },
+                _ => return Err(HyperError::InValidMmioWrite),
+            };
+            Ok(())
+        }
+    }
+}
+
+pub struct PciBarAllocator {
+    mem32_alloc: BTreeMap<u64, u64>,
+    mem64_alloc: BTreeMap<u64, u64>,
+    io_alloc: BTreeMap<u64, u64>,
+}
+
+impl PciBarAllocator {
+    pub fn new() -> Self {
+        Self {
+            mem32_alloc: BTreeMap::new(),
+            mem64_alloc: BTreeMap::new(),
+            io_alloc: BTreeMap::new(),
+        }
+    }
+
+    pub fn alloc(&mut self, region_type: RegionType, size: u64) -> HyperResult<u64> {
+        let (alloc_map, base, limit) = match region_type {
+            RegionType::Mem32Bit => (
+                &mut self.mem32_alloc,
+                PCI_EMUL_MEMBASE32,
+                PCI_EMUL_MEMLIMIT32,
+            ),
+            RegionType::Mem64Bit => (
+                &mut self.mem64_alloc,
+                PCI_EMUL_MEMBASE64,
+                PCI_EMUL_MEMLIMIT64,
+            ),
+            RegionType::Io => (&mut self.io_alloc, PCI_EMUL_IOBASE, PCI_EMUL_IOLIMIT),
         };
-        write_func(offset, access_size, value_byte)
+        debug!("alloc map:{:#?}", alloc_map);
+        let mut addr = base;
+        debug!("addr in alloc begin:{:#x}", addr);
+        for (&start, &end) in alloc_map.iter() {
+            if addr + size <= start {
+                alloc_map.insert(addr, addr + size);
+                debug!("this is addr in alloc map:{:#x}", addr);
+                return Ok(addr);
+            }
+            addr = end;
+        }
+
+        if addr + size <= limit {
+            alloc_map.insert(addr, addr + size);
+            debug!("after return addr in alloc map:{:#x}", addr);
+            return Ok(addr);
+        }
+
+        Err(HyperError::InvalidBarAddress)
+    }
+
+    pub fn alloc_addr(
+        &mut self,
+        region_type: RegionType,
+        size: u64,
+        specific_addr: u64,
+    ) -> HyperResult<u64> {
+        // align up to 4KB
+        let size = (size + 0xfff) & !0xfff;
+        let (alloc_map, base, limit) = match region_type {
+            RegionType::Mem32Bit => (
+                &mut self.mem32_alloc,
+                PCI_EMUL_MEMBASE32,
+                PCI_EMUL_MEMLIMIT32,
+            ),
+            RegionType::Mem64Bit => (
+                &mut self.mem64_alloc,
+                PCI_EMUL_MEMBASE64,
+                PCI_EMUL_MEMLIMIT64,
+            ),
+            RegionType::Io => (&mut self.io_alloc, PCI_EMUL_IOBASE, PCI_EMUL_IOLIMIT),
+        };
+
+        if specific_addr < base || specific_addr + size > limit {
+            return Err(HyperError::InvalidBarAddress);
+        }
+
+        for (&start, &end) in alloc_map.iter() {
+            if specific_addr >= start && specific_addr + size <= end {
+                return Err(HyperError::InvalidBarAddress);
+            }
+        }
+
+        alloc_map.insert(specific_addr, specific_addr + size);
+        Ok(specific_addr)
+    }
+
+    pub fn dealloc(&mut self, region_type: RegionType, addr: u64) -> HyperResult<()> {
+        let alloc_map = match region_type {
+            RegionType::Mem32Bit => &mut self.mem32_alloc,
+            RegionType::Mem64Bit => &mut self.mem64_alloc,
+            RegionType::Io => &mut self.io_alloc,
+        };
+
+        alloc_map.remove(&addr);
+        Ok(())
     }
 }
 
 /// Capbility ID defined by PCIe/PCI spec.
 pub enum CapId {
+    Msi = 0x05,
     Pcie = 0x10,
     Msix,
 }
@@ -420,7 +586,7 @@ pub enum PcieDevType {
 
 /// Configuration space of PCI/PCIe device.
 #[derive(Clone)]
-pub struct PciConfig {
+pub struct PciConfig<B: BarAllocTrait> {
     /// Configuration space data.
     pub config: Vec<u8>,
     /// Mask of writable bits.
@@ -437,9 +603,11 @@ pub struct PciConfig {
     pub last_ext_cap_end: u16,
     /// MSI-X information.
     pub msix: Option<Arc<Mutex<Msix>>>,
+    /// Phantom data.
+    _phantom: PhantomData<B>,
 }
 
-impl PciConfig {
+impl<B: BarAllocTrait> PciConfig<B> {
     /// Construct new PciConfig entity.
     ///
     /// # Arguments
@@ -452,6 +620,7 @@ impl PciConfig {
             bars.push(Bar {
                 region_type: RegionType::Mem32Bit,
                 address: 0,
+                actual_address: 0,
                 size: 0,
                 ops: None,
             });
@@ -466,6 +635,7 @@ impl PciConfig {
             last_ext_cap_offset: 0,
             last_ext_cap_end: PCI_CONFIG_SPACE_SIZE as u16,
             msix: None,
+            _phantom: PhantomData,
         }
     }
 
@@ -557,6 +727,11 @@ impl PciConfig {
         }
 
         let size = buf.len();
+        debug!(
+            "read offset: {} content:: {:?}",
+            offset,
+            &self.config[offset..(offset + size)] as &[u8]
+        );
 
         buf[..].copy_from_slice(&self.config[offset..(offset + size)]);
     }
@@ -582,7 +757,6 @@ impl PciConfig {
 
         Ok(())
     }
-
     /// # Arguments
     ///
     /// * `offset` - Offset in the configuration space from which to write.
@@ -754,6 +928,12 @@ impl PciConfig {
         self.validate_bar_id(id)?;
         self.validate_bar_size(region_type, size)?;
         let offset: usize = BAR_0 as usize + id * REG_SIZE;
+        let size = if region_type == RegionType::Io {
+            size
+        } else {
+            // align up to 4KB
+            (size + 0xfff) & !0xfff
+        };
         match region_type {
             RegionType::Io => {
                 let write_mask = !(size - 1) as u32;
@@ -773,11 +953,32 @@ impl PciConfig {
         if prefetchable {
             self.config[offset] |= BAR_PREFETCH;
         }
+        debug!("this is register bar\n");
+        let mut allocator = PCI_BAR_ALLOCATOR.lock();
+        let addr = allocator.alloc(region_type, size)?;
+        let actual_addr = B::alloc(region_type, size)?;
 
         self.bars[id].ops = ops;
         self.bars[id].region_type = region_type;
-        self.bars[id].address = BAR_SPACE_UNMAPPED;
+        // self.bars[id].address = BAR_SPACE_UNMAPPED;
+        self.bars[id].address = addr;
+        self.bars[id].actual_address = actual_addr;
         self.bars[id].size = size;
+
+        // Write the front part of addr into self.config[offset + 4] to self.config[offset + 31]
+        for i in 0..4 {
+            if i == 0 {
+                self.config[offset + i] |= (addr as u8) & !0xf;
+            } else {
+                self.config[offset + i] |= (addr >> (i * 8)) as u8;
+            }
+        }
+        debug!(
+            "after register content:: {:?} addr:{:#x} actual addr:{:#x}",
+            &self.config[offset..(offset + 4)] as &[u8],
+            addr,
+            actual_addr
+        );
         Ok(())
     }
 
@@ -786,16 +987,25 @@ impl PciConfig {
     /// # Arguments
     ///
     /// * `bus` - The bus which region registered.
-    pub fn unregister_bars(&mut self, _bus: &Arc<Mutex<PciBus>>) -> Result<()> {
+    pub fn unregister_bars(&mut self, _bus: &Arc<Mutex<PciBus<B>>>) -> Result<()> {
         // let locked_bus = bus.lock();
-        for bar in self.bars.iter_mut() {
+        for (i, bar) in self.bars.iter_mut().enumerate() {
             if bar.address == BAR_SPACE_UNMAPPED || bar.size == 0 {
                 continue;
             }
             // Invalid the bar region
+            {
+                let mut allocator = PCI_BAR_ALLOCATOR.lock();
+                allocator.dealloc(bar.region_type, bar.address)?;
+            }
+            B::dealloc(bar.region_type, bar.actual_address, bar.size)?;
             bar.address = BAR_SPACE_UNMAPPED;
+            bar.actual_address = BAR_SPACE_UNMAPPED;
             bar.size = 0;
             bar.ops = None;
+            for j in 0..4 {
+                self.config[BAR_0 as usize + i + j] = 0;
+            }
         }
 
         Ok(())
@@ -809,6 +1019,7 @@ impl PciConfig {
             }
 
             let new_addr: u64 = self.get_bar_address(id);
+            debug!("[update_bar_mapping] id: {}, new_addr: {:#x}", id, new_addr);
             // if the bar is not updated, just skip it.
             if self.bars[id].address == new_addr {
                 continue;
@@ -816,16 +1027,10 @@ impl PciConfig {
 
             // first unmmap origin bar region
             if self.bars[id].address != BAR_SPACE_UNMAPPED {
-                match self.bars[id].region_type {
-                    #[cfg(target_arch = "x86_64")]
-                    RegionType::Io => {
-                        let range = (self.bars[id].address as u16)
-                            ..(self.bars[id].address + self.bars[id].size) as u16;
-                    }
-                    _ => {
-                        let range =
-                            self.bars[id].address..self.bars[id].address + self.bars[id].size;
-                    }
+                // Invalid the bar region
+                {
+                    let mut allocator = PCI_BAR_ALLOCATOR.lock();
+                    allocator.dealloc(self.bars[id].region_type, self.bars[id].address);
                 }
                 self.bars[id].address = BAR_SPACE_UNMAPPED;
             }
@@ -837,6 +1042,17 @@ impl PciConfig {
             // map new region
             if new_addr != BAR_SPACE_UNMAPPED {
                 self.bars[id].address = new_addr;
+                let mut allocator = PCI_BAR_ALLOCATOR.lock();
+                allocator.alloc_addr(self.bars[id].region_type, self.bars[id].size, new_addr)?;
+                // Write the front part of addr into self.config[offset + 4] to self.config[offset + 31]
+                let offset = BAR_0 as usize + id as usize * REG_SIZE;
+                for i in 0..4 {
+                    if i == 0 {
+                        self.config[offset + i] |= (new_addr as u8) & !0xf;
+                    } else {
+                        self.config[offset + i] |= (new_addr >> (i * 8)) as u8;
+                    }
+                }
             }
         }
         Ok(())
@@ -864,26 +1080,33 @@ impl PciConfig {
     /// * `id` - Capability ID.
     /// * `size` - Size of the capability.
     pub fn add_pci_cap(&mut self, id: u8, size: usize) -> Result<usize> {
+        // offset is the base offset of the next capability.
         let offset = self.last_cap_end as usize;
         if offset + size > PCI_CONFIG_SPACE_SIZE {
             return Err(HyperError::PciError(PciError::AddPciCap(id, size)));
         }
-
+        // every time add the new capability to the head of the capability list.
+        // [0:7]: id
         self.config[offset] = id;
+        // [8:15]: next capability offset. the first saved capablilty(address by 0x34)
         self.config[offset + NEXT_CAP_OFFSET as usize] = self.config[CAP_LIST as usize];
+        // update the head of the capability list.
         self.config[CAP_LIST as usize] = offset as u8;
+        // [4]: Capabilities List. This optional read-only bit indicates whether or not this device implements the pointer for a New Capabilities linked list at offset 34h.
         self.config[STATUS as usize] |= STATUS_CAP_LIST as u8;
 
+        // caculate how many regs this capability will occupy.
         let regs_num = if size % REG_SIZE == 0 {
             size / REG_SIZE
         } else {
             size / REG_SIZE + 1
         };
+        // update write_mask and mov capability to next offset.
         for _ in 0..regs_num {
             le_write_u32(&mut self.write_mask, self.last_cap_end as usize, 0)?;
             self.last_cap_end += REG_SIZE as u16;
         }
-
+        // return this capability offset.
         Ok(offset)
     }
 

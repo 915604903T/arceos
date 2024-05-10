@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use core::ops::Range;
 use spin::Mutex;
 
-use crate::{bus::PciBus, MsiIrqManager, PciDevOps};
+use crate::{bus::PciBus, BarAllocTrait, MsiIrqManager, PciDevOps};
 #[cfg(target_arch = "x86_64")]
 use crate::{le_read_u32, le_write_u32};
 
@@ -31,13 +31,13 @@ const PCI_CFG_ADDR_PORT: Range<u16> = 0xcf8..0xcf8 + 4;
 const PCI_CFG_DATA_PORT: Range<u16> = 0xcfc..0xcfc + 4;
 
 #[derive(Clone)]
-pub struct PciHost {
-    pub root_bus: Arc<Mutex<PciBus>>,
+pub struct PciHost<B: BarAllocTrait> {
+    pub root_bus: Arc<Mutex<PciBus<B>>>,
     #[cfg(target_arch = "x86_64")]
     config_addr: u32,
 }
 
-impl PciHost {
+impl<B: BarAllocTrait> PciHost<B> {
     /// Construct PCI/PCIe host.
     pub fn new(msi_irq_manager: Option<Arc<dyn MsiIrqManager>>) -> Self {
         // #[cfg(target_arch = "x86_64")]
@@ -51,7 +51,7 @@ impl PciHost {
         }
     }
 
-    pub fn find_device(&self, bus_num: u8, devfn: u8) -> Option<Arc<Mutex<dyn PciDevOps>>> {
+    pub fn find_device(&self, bus_num: u8, devfn: u8) -> Option<Arc<Mutex<dyn PciDevOps<B>>>> {
         let locked_root_bus = self.root_bus.lock();
         if bus_num == 0 {
             return locked_root_bus.get_device(0, devfn);
@@ -65,12 +65,16 @@ impl PciHost {
     }
 }
 
-impl PioOps for PciHost {
+impl<B: BarAllocTrait> PioOps for PciHost<B> {
     fn port_range(&self) -> Range<u16> {
         PCI_CFG_ADDR_PORT.start..PCI_CFG_DATA_PORT.end
     }
 
     fn read(&mut self, port: u16, access_size: u8) -> HyperResult<u32> {
+        debug!(
+            "this is pci host read port:{:#x} access_size:{}",
+            port, access_size
+        );
         let mut data = [0xffu8; 4]; // max access size is 4
         let cloned_hb = self.clone();
         if PCI_CFG_ADDR_PORT.contains(&port) {
@@ -87,6 +91,7 @@ impl PioOps for PciHost {
 
             let mut offset: u32 = (cloned_hb.config_addr & !CONFIG_ADDRESS_ENABLE_MASK)
                 + (port - PCI_CFG_DATA_PORT.start) as u32;
+            debug!("in pci read: offset:{:#x}", offset);
             let bus_num = ((offset >> PIO_BUS_SHIFT) & CONFIG_BUS_MASK) as u8;
             let devfn = ((offset >> PIO_DEVFN_SHIFT) & CONFIG_DEVFN_MASK) as u8;
             match cloned_hb.find_device(bus_num, devfn) {
@@ -110,6 +115,10 @@ impl PioOps for PciHost {
     }
 
     fn write(&mut self, port: u16, access_size: u8, value: u32) -> HyperResult {
+        debug!(
+            "this is pci host write port:{:#x} access_size:{} value:{:#x}",
+            port, access_size, value
+        );
         if PCI_CFG_ADDR_PORT.contains(&port) {
             // Write configuration address register.
             if port != PCI_CFG_ADDR_PORT.start || access_size != 4 {

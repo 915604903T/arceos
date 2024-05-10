@@ -7,8 +7,8 @@ use spin::Mutex;
 
 use crate::config::{CapId, RegionType, MINIMUM_BAR_SIZE_FOR_MMIO};
 use crate::util::num_ops::{ranges_overlap, round_up};
-use crate::MsiIrqManager;
 use crate::{le_read_u16, le_read_u64, le_write_u16, le_write_u32, le_write_u64, PciDevBase};
+use crate::{BarAllocTrait, MsiIrqManager};
 use hypercraft::{HyperError, HyperResult, RegionOps};
 
 pub const MSIX_TABLE_ENTRY_SIZE: u16 = 16;
@@ -357,8 +357,8 @@ impl Msix {
         // let pba_size = locked_msix.pba.len() as u64;
 
         let cloned_msix = msix.clone();
-        let read = move |offset: u64, access_size: u8| -> HyperResult<u32> {
-            let mut data = [0u8; 4];
+        let read = move |offset: u64, access_size: u8| -> HyperResult<u64> {
+            let mut data = [0u8; 8];
             let access_offset = offset as usize + access_size as usize;
             if access_offset > cloned_msix.lock().table.len() {
                 if access_offset > cloned_msix.lock().table.len() + cloned_msix.lock().pba.len() {
@@ -373,14 +373,14 @@ impl Msix {
                 data.copy_from_slice(
                     &cloned_msix.lock().pba[offset..(offset + access_size as usize)],
                 );
-                return Ok(u32::from_le_bytes(data));
+                return Ok(u64::from_le_bytes(data));
             }
             // msix table read
             data.copy_from_slice(
                 &cloned_msix.lock().table
                     [offset as usize..(offset as usize + access_size as usize)],
             );
-            Ok(u32::from_le_bytes(data))
+            Ok(u64::from_le_bytes(data))
         };
 
         let cloned_msix = msix.clone();
@@ -436,8 +436,8 @@ impl Msix {
 /// * `parent_region` - Parent region which the MSI-X region registered. If none, registered in BAR.
 /// * `offset_opt` - Offset of table(table_offset) and Offset of pba(pba_offset). Set the
 ///   table_offset and pba_offset together.
-pub fn init_msix(
-    pcidev_base: &mut PciDevBase,
+pub fn init_msix<B: BarAllocTrait>(
+    pcidev_base: &mut PciDevBase<B>,
     bar_id: usize,
     vector_nr: u32,
     dev_id: Arc<AtomicU16>,

@@ -5,32 +5,32 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 use spin::Mutex;
 
+use crate::config::BarAllocTrait;
 use crate::{
-    config::{BRIDGE_CONTROL, BRIDGE_CTL_SEC_BUS_RESET, SECONDARY_BUS_NUM, SUBORDINATE_BUS_NUM, Bar},
+    config::{
+        Bar, BRIDGE_CONTROL, BRIDGE_CTL_SEC_BUS_RESET, SECONDARY_BUS_NUM, SUBORDINATE_BUS_NUM,
+    },
     MsiIrqManager, PciDevOps,
 };
-use hypercraft::{
-    HyperError, HyperResult as Result, PciError,
-    PioOps, MmioOps,
-};
+use hypercraft::{HyperError, HyperResult as Result, MmioOps, PciError, PioOps};
 
-type DeviceBusInfo = (Arc<Mutex<PciBus>>, Arc<Mutex<dyn PciDevOps>>);
+type DeviceBusInfo<B: BarAllocTrait> = (Arc<Mutex<PciBus<B>>>, Arc<Mutex<dyn PciDevOps<B>>>);
 
 /// PCI bus structure.
-pub struct PciBus {
+pub struct PciBus<B: BarAllocTrait> {
     /// Bus name
     pub name: String,
     /// Devices attached to the bus.
-    pub devices: BTreeMap<u8, Arc<Mutex<dyn PciDevOps>>>,
+    pub devices: BTreeMap<u8, Arc<Mutex<dyn PciDevOps<B>>>>,
     /// Child buses of the bus.
-    pub child_buses: Vec<Arc<Mutex<PciBus>>>,
+    pub child_buses: Vec<Arc<Mutex<PciBus<B>>>>,
     /// Pci bridge which the bus originates from.
-    pub parent_bridge: Option<Weak<Mutex<dyn PciDevOps>>>,
+    pub parent_bridge: Option<Weak<Mutex<dyn PciDevOps<B>>>>,
     /// MSI interrupt manager.
     pub msi_irq_manager: Option<Arc<dyn MsiIrqManager>>,
 }
 
-impl PciBus {
+impl<B: BarAllocTrait> PciBus<B> {
     /// Create new bus entity.
     ///
     /// # Arguments
@@ -65,8 +65,9 @@ impl PciBus {
     ///
     /// * `bus_num` - The bus number.
     /// * `devfn` - Slot number << 8 | device number.
-    pub fn get_device(&self, bus_num: u8, devfn: u8) -> Option<Arc<Mutex<dyn PciDevOps>>> {
+    pub fn get_device(&self, bus_num: u8, devfn: u8) -> Option<Arc<Mutex<dyn PciDevOps<B>>>> {
         if let Some(dev) = self.devices.get(&devfn) {
+            debug!("Find device {}:{}", bus_num, devfn);
             return Some((*dev).clone());
         }
         debug!("Can't find device {}:{}", bus_num, devfn);
@@ -81,7 +82,7 @@ impl PciBus {
             let pci_config = &pci_dev_base.config;
             if let Some(bar) = pci_config.find_pio(port) {
                 return Some(Arc::new(Mutex::new(bar.clone())));
-            } 
+            }
         }
         None
     }
@@ -94,7 +95,7 @@ impl PciBus {
             let pci_config = &pci_dev_base.config;
             if let Some(bar) = pci_config.find_mmio(address) {
                 return Some(Arc::new(Mutex::new(bar.clone())));
-            }      
+            }
         }
         None
     }
@@ -158,7 +159,10 @@ impl PciBus {
     ///
     /// * `pci_bus` - On which bus to find.
     /// * `name` - Device name.
-    pub fn find_attached_bus(pci_bus: &Arc<Mutex<PciBus>>, name: &str) -> Option<DeviceBusInfo> {
+    pub fn find_attached_bus(
+        pci_bus: &Arc<Mutex<PciBus<B>>>,
+        name: &str,
+    ) -> Option<DeviceBusInfo<B>> {
         // Device is attached in pci_bus.
         let locked_bus = pci_bus.lock();
         for dev in locked_bus.devices.values() {
@@ -181,7 +185,7 @@ impl PciBus {
     ///
     /// * `bus` - Bus to detach from.
     /// * `dev` - Device attached to the bus.
-    pub fn detach_device(bus: &Arc<Mutex<Self>>, dev: &Arc<Mutex<dyn PciDevOps>>) -> Result<()> {
+    pub fn detach_device(bus: &Arc<Mutex<Self>>, dev: &Arc<Mutex<dyn PciDevOps<B>>>) -> Result<()> {
         let mut dev_locked = dev.lock();
         dev_locked.unrealize().map_err(|_err| {
             HyperError::PciError(PciError::Other(format!(
