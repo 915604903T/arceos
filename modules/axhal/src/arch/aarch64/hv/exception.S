@@ -79,7 +79,6 @@
 
 
 .section .text
-# .section .el2code
 .p2align 11
 .global exception_vector_base_el2
 exception_vector_base_el2:
