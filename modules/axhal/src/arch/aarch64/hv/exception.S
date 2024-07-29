@@ -62,19 +62,16 @@
 .macro HANDLE_CURRENT_IRQ
 .p2align 7
     bl      LOWER_AARCH64_IRQ_HANDLER
-    b       .Lexception_return_el2
 .endm
 
 .macro HANDLE_LOWER_IRQ
 .p2align 7
     bl      LOWER_AARCH64_IRQ_HANDLER
-    b       .Lexception_return_el2
 .endm
 
 .macro HANDLE_LOWER_SYNC
 .p2align 7
     bl      LOWER_AARCH64_SYNCHROUNOUS_HANDLER
-    b       .Lexception_return_el2
 .endm
 
 
