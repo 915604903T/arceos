@@ -61,17 +61,26 @@
 
 .macro HANDLE_CURRENT_IRQ
 .p2align 7
-    bl      LOWER_AARCH64_IRQ_HANDLER
+    SAVE_REGS_EL2
+    ldr     x9, =LOWER_AARCH64_IRQ_HANDLER
+    ldr     x8, [x9]
+    blr     x8
 .endm
 
 .macro HANDLE_LOWER_IRQ
 .p2align 7
-    bl      LOWER_AARCH64_IRQ_HANDLER
+    SAVE_REGS_EL2
+    ldr     x9, =LOWER_AARCH64_IRQ_HANDLER
+    ldr     x8, [x9]
+    blr     x8
 .endm
 
 .macro HANDLE_LOWER_SYNC
 .p2align 7
-    bl      LOWER_AARCH64_SYNCHROUNOUS_HANDLER
+    SAVE_REGS_EL2
+    ldr     x9, =LOWER_AARCH64_SYNCHROUNOUS_HANDLER
+    ldr     x8, [x9]
+    blr     x8
 .endm
 
 
